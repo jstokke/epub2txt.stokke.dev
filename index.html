@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EPUB to Text Converter (Offline)</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            max-width: 600px;
+            margin: 40px auto;
+            padding: 20px;
+            line-height: 1.6;
+            color: #333;
+            background-color: #f4f4f9;
+        }
+
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+        }
+
+        h2 {
+            margin-top: 0;
+        }
+
+        .upload-btn-wrapper {
+            position: relative;
+            overflow: hidden;
+            display: inline-block;
+            margin-top: 20px;
+        }
+
+        input[type=file] {
+            font-size: 16px;
+        }
+
+        #status {
+            margin-top: 20px;
+            padding: 10px;
+            background-color: #eef;
+            border-radius: 4px;
+            display: none;
+            white-space: pre-wrap;
+            /* Keeps formatting if we show errors */
+        }
+
+        .success {
+            color: green;
+            border-left: 4px solid green;
+        }
+
+        .error {
+            color: #d8000c;
+            border-left: 4px solid #d8000c;
+            background-color: #ffbaba;
+        }
+    </style>
+</head>
+
+<body>
+
+    <div class="container">
+        <h2>EPUB to Plain Text</h2>
+        <p>Select an .epub file. It will be converted to a clean .txt file and downloaded automatically.</p>
+
+        <input type="file" id="upload" accept=".epub" />
+
+        <div id="status"></div>
+    </div>
+
+    <script>
+        /**
+         * Recursive function to extract text while preserving "Publisher Intent"
+         * Handles headers, lists, paragraphs, and breaks.
+         */
+        function extractTextFromNode(node) {
+            // 1. Text Nodes: Collapse extra whitespace into a single space
+            if (node.nodeType === Node.TEXT_NODE) {
+                return (node.textContent || "").replace(/\s+/g, ' ');
+            }
+
+            // 2. Element Nodes
+            if (node.nodeType !== Node.ELEMENT_NODE) return "";
+
+            const tagName = node.tagName.toLowerCase();
+            let text = "";
+
+            // Recursively process children
+            node.childNodes.forEach(child => {
+                text += extractTextFromNode(child);
+            });
+
+            // 3. Apply Formatting Rules
+            switch (tagName) {
+                // Headers: Add breathing room and capitalization
+                case 'h1': case 'h2': case 'h3':
+                case 'h4': case 'h5': case 'h6':
+                    return `\n\n${text.trim().toUpperCase()}\n\n`;
+
+                // Blocks: Standard newline separation
+                case 'p':
+                case 'div':
+                case 'section':
+                case 'blockquote':
+                    return `\n${text.trim()}\n`;
+
+                // Lists
+                case 'li':
+                    return `\n• ${text.trim()}`;
+                case 'ul':
+                case 'ol':
+                    return `\n${text}\n`; // wrapper for the list items
+
+                // Line Breaks and Rules
+                case 'br':
+                    return `\n`;
+                case 'hr':
+                    return `\n--------------------------------\n`;
+
+                // Inline formatting (b, i, span) -> just return the text
+                default:
+                    return text;
+            }
+        }
+
+        async function convertEpub(file) {
+            const zip = await JSZip.loadAsync(file);
+            const parser = new DOMParser();
+
+            // 1. Find the OPF file path from container.xml
+            // Standard location for EPUB metadata
+            const containerXml = await zip.file("META-INF/container.xml")?.async("string");
+            if (!containerXml) throw new Error("This file does not appear to be a valid EPUB (missing container.xml).");
+
+            const containerDoc = parser.parseFromString(containerXml, "application/xml");
+            const rootfile = containerDoc.querySelector("rootfile");
+            const opfPath = rootfile?.getAttribute("full-path");
+            if (!opfPath) throw new Error("Could not locate the book manifest (OPF file).");
+
+            // 2. Read the OPF file to get the spine (reading order)
+            const opfContent = await zip.file(opfPath)?.async("string");
+            if (!opfContent) throw new Error("OPF manifest file is missing from the zip.");
+
+            const opfDoc = parser.parseFromString(opfContent, "application/xml");
+
+            // Calculate the base directory for relative paths (e.g., if opf is in OEBPS/content.opf)
+            const opfDir = opfPath.includes('/') ? opfPath.substring(0, opfPath.lastIndexOf('/')) : '';
+
+            // 3. Map Manifest (ID -> Filename)
+            // We need this because the spine refers to IDs, not filenames.
+            const manifestItems = {};
+            opfDoc.querySelectorAll("manifest > item").forEach(item => {
+                const id = item.getAttribute("id");
+                const href = item.getAttribute("href");
+                if (id && href) manifestItems[id] = href;
+            });
+
+            // 4. Iterate over the Spine (The visual order of the book)
+            const spineItems = Array.from(opfDoc.querySelectorAll("spine > itemref"));
+            let fullText = "";
+
+            // Status update helper
+            const statusEl = document.getElementById('status');
+            const total = spineItems.length;
+
+            for (let i = 0; i < total; i++) {
+                const item = spineItems[i];
+                const idref = item.getAttribute("idref");
+
+                if (idref && manifestItems[idref]) {
+                    let fileName = manifestItems[idref];
+                    // Resolve path relative to OPF location
+                    const fullPath = opfDir ? `${opfDir}/${fileName}` : fileName;
+
+                    const htmlContent = await zip.file(fullPath)?.async("string");
+
+                    if (htmlContent) {
+                        const doc = parser.parseFromString(htmlContent, "text/html");
+
+                        // Add a page/chapter delimiter for clarity
+                        if (fullText.length > 0) fullText += "\n\n";
+
+                        fullText += extractTextFromNode(doc.body);
+
+                        // Update progress occasionally
+                        if (i % 5 === 0) {
+                            statusEl.innerText = `Processing chapter ${i + 1} of ${total}...`;
+                        }
+                    }
+                }
+            }
+
+            return fullText.trim();
+        }
+
+        function downloadFile(filename, content) {
+            const blob = new Blob([content], { type: 'text/plain' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }
+
+        // --- Event Listeners ---
+
+        const fileInput = document.getElementById('upload');
+        const statusDiv = document.getElementById('status');
+
+        fileInput.addEventListener('change', async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            statusDiv.style.display = 'block';
+            statusDiv.className = '';
+            statusDiv.innerText = "Reading EPUB file...";
+
+            try {
+                // Give the UI a split second to update before the heavy lifting starts
+                await new Promise(r => setTimeout(r, 50));
+
+                const text = await convertEpub(file);
+
+                const newFileName = file.name.replace(/\.epub$/i, '') + ".txt";
+                downloadFile(newFileName, text);
+
+                statusDiv.className = 'success';
+                statusDiv.innerText = `Success! Downloaded "${newFileName}"`;
+
+            } catch (err) {
+                console.error(err);
+                statusDiv.className = 'error';
+                statusDiv.innerText = `Error: ${err.message}`;
+            }
+        });
+    </script>
+
+</body>
+
+</html>
